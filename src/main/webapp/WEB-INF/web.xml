@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<web-app xmlns="https://jakarta.ee/xml/ns/jakartaee"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="https://jakarta.ee/xml/ns/jakartaee https://jakarta.ee/xml/ns/jakartaee/web-app_6_0.xsd"
+         version="6.0">
+
+    <welcome-file-list>
+        <welcome-file>login.jsp</welcome-file>
+    </welcome-file-list>
+
+    <!-- Roles -->
+    <security-role>
+        <role-name>member</role-name>
+    </security-role>
+    <security-role>
+        <role-name>librarian</role-name>
+    </security-role>
+
+    <!-- Catalogue: both roles -->
+    <security-constraint>
+        <web-resource-collection>
+            <web-resource-name>Catalogue</web-resource-name>
+            <url-pattern>/catalogue</url-pattern>
+        </web-resource-collection>
+        <auth-constraint>
+            <role-name>member</role-name>
+            <role-name>librarian</role-name>
+        </auth-constraint>
+    </security-constraint>
+
+    <!-- Borrow, return, My Loans: member only -->
+    <security-constraint>
+        <web-resource-collection>
+            <web-resource-name>Member Loans</web-resource-name>
+            <url-pattern>/loans</url-pattern>
+            <url-pattern>/borrow</url-pattern>
+            <url-pattern>/return</url-pattern>
+        </web-resource-collection>
+        <auth-constraint>
+            <role-name>member</role-name>
+        </auth-constraint>
+    </security-constraint>
+
+    <!-- Member + book management: librarian only -->
+    <security-constraint>
+        <web-resource-collection>
+            <web-resource-name>Librarian Area</web-resource-name>
+            <url-pattern>/librarian/*</url-pattern>
+        </web-resource-collection>
+        <auth-constraint>
+            <role-name>librarian</role-name>
+        </auth-constraint>
+    </security-constraint>
+
+    <!-- FORM login -->
+    <login-config>
+        <auth-method>FORM</auth-method>
+        <realm-name>LIBIS</realm-name>
+        <form-login-config>
+            <form-login-page>/login.jsp</form-login-page>
+            <form-error-page>/login-error.jsp</form-error-page>
+        </form-login-config>
+    </login-config>
+
+    <!-- SQL errors never reach the page -->
+    <error-page>
+        <exception-type>bw.ac.bac.libis.exception.DataAccessException</exception-type>
+        <location>/WEB-INF/error.jsp</location>
+    </error-page>
+
+</web-app>
