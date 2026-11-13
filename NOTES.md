@@ -1,7 +1,19 @@
 # Jakarta Web App Cheat Sheet (Servlet + JSP + JDBC + MySQL + Tomcat FORM security)
 
-Stack: Maven, Tomcat 11 (Jakarta Servlet 6.1), JSP + JSTL/EL (no scriptlets), JDBC with DAOs, MySQL, DataSourceRealm, JSTL fmt for i18n.
+Stack: Maven, Tomcat 11 (Jakarta Servlet 6.1), JSP + JSTL/EL (no scriptlets), DAOs (plain JDBC **or** Jdbi, both shown), MySQL, DataSourceRealm, JSTL fmt for i18n.
 Examples use LIBIS (Book, Member, Loan). **Rename** the domain and find/replace `your.pkg` with your root package.
+
+## DAO style: pick one (both are written out)
+
+| | **Style A: plain JDBC** | **Style B: Jdbi** |
+|---|---|---|
+| Code per entity | interface + `Impl` class (`query`, `bind`, `map`, `fail` helpers) | one interface, SQL inside annotations |
+| "PreparedStatement + try-with-resources" rule | you write it, the marker can see it | done inside the library |
+| Extra dependency | none | `jdbi3-core` + `jdbi3-sqlobject` |
+| Failures | you catch `SQLException`, throw `DataAccessException` | Jdbi throws `JdbiException` (unchecked), mapped in `web.xml` |
+| Use it for | CA3, exams, anything that says "plain JDBC" | personal projects, or when your lecturer approves it |
+
+Sections tagged **[A]** and **[B]** show each style. Anything not tagged is the same for both. Services, controllers and JSPs have identical logic in both styles; only how they obtain a DAO changes (end of section 10).
 
 ## Contents
 
@@ -22,6 +34,7 @@ Examples use LIBIS (Book, Member, Loan). **Rename** the domain and find/replace 
 15. [i18n (English + Setswana)](#15-i18n-english--setswana)
 16. [Rules checklist + evidence screenshots](#16-rules-checklist--evidence-screenshots)
 17. [Troubleshooting](#17-troubleshooting)
+18. [Adapting this to a different project](#18-adapting-this-to-a-different-project)
 
 ---
 
@@ -161,6 +174,29 @@ Notes:
 - IntelliJ: Settings -> Compiler -> Annotation Processors -> **Enable annotation processing** (for Lombok).
 - `maven.compiler.source/target` of 8 breaks the Servlet 6 API. Use `release` 17+.
 - Using `provided` for the MySQL jar avoids a duplicate copy in `WEB-INF/lib` (it belongs in Tomcat `lib`).
+
+**[B] Jdbi only: add these** (both Jdbi artifacts must have the same version; `3.54.0` was the newest I found, use `3.53.0` if it will not resolve; Jdbi needs Java 11+). In `<properties>`:
+
+```xml
+<jdbi.version>3.54.0</jdbi.version>
+```
+
+In `<dependencies>` (compile scope, so they are packaged into the WAR):
+
+```xml
+<dependency>
+    <groupId>org.jdbi</groupId>
+    <artifactId>jdbi3-core</artifactId>
+    <version>${jdbi.version}</version>
+</dependency>
+<dependency>
+    <groupId>org.jdbi</groupId>
+    <artifactId>jdbi3-sqlobject</artifactId>
+    <version>${jdbi.version}</version>
+</dependency>
+```
+
+A `SLF4J: No SLF4J providers` line in the log is a harmless warning.
 
 ---
 
@@ -356,7 +392,9 @@ Notes:
 
 ## 6. Config: JNDI helper
 
-`config/Database.java`:
+Both styles read the same pooled DataSource from `context.xml`. Only what `Database` hands out differs.
+
+### [A] Plain JDBC: `config/Database.java`
 
 ```java
 package your.pkg.config;
@@ -396,6 +434,55 @@ public final class Database {
 ```
 
 `Name [jdbc/appdb] is not bound` in the log means context.xml was not applied (section 3).
+
+### [B] Jdbi: `config/Database.java`
+
+Builds one `Jdbi` from the same JNDI DataSource and creates DAO objects from your interfaces.
+
+```java
+package your.pkg.config;
+
+import javax.naming.Context;
+import javax.naming.InitialContext;
+import javax.naming.NamingException;
+import javax.sql.DataSource;
+
+import org.jdbi.v3.core.Jdbi;
+import org.jdbi.v3.sqlobject.SqlObjectPlugin;
+
+import your.pkg.exception.DataAccessException;
+
+/** Builds one Jdbi from the pooled DataSource in context.xml and creates DAOs from interfaces. */
+public final class Database {
+
+    private static Jdbi jdbi;
+
+    private Database() {}
+
+    /**
+     * Returns a ready-to-use implementation of a DAO interface.
+     * "onDemand" means every method call borrows a pooled connection and gives it back afterwards,
+     * so there is no connection code to write or close.
+     */
+    public static <T> T dao(Class<T> daoType) {
+        return jdbi().onDemand(daoType);
+    }
+
+    private static synchronized Jdbi jdbi() {
+        if (jdbi == null) {
+            try {
+                Context env = (Context) new InitialContext().lookup("java:comp/env");
+                DataSource dataSource = (DataSource) env.lookup("jdbc/appdb");   // same name as <Resource name>
+                jdbi = Jdbi.create(dataSource);
+                jdbi.installPlugin(new SqlObjectPlugin());                        // enables annotation-based DAOs
+            } catch (NamingException e) {
+                throw new DataAccessException("DataSource jdbc/appdb not found", e);
+            }
+        }
+        return jdbi;
+    }
+}
+```
 
 ---
 
@@ -518,6 +605,25 @@ Map unchecked exceptions in `web.xml` (section 13).
 ---
 
 ## 9. DAOs
+
+The same operations in both styles:
+
+| Task | [A] plain JDBC | [B] Jdbi |
+|---|---|---|
+| Run a SELECT | `query(SELECT + " WHERE ...", params)` | `@SqlQuery(SELECT + " WHERE ...")` on an interface method |
+| Pass a value | `?` + `ps.setObject(i + 1, value)` | `:name` + `@Bind("name")` |
+| Pass a whole object | `bind(ps, book)` with numbered `setX` calls | `@BindBean Book book` and `:isbn`, `:title`... |
+| Row to object | `map(rs)` | `@RegisterBeanMapper(Book.class)` (`book_id` matches `bookId` by itself; use `AS` if names differ) |
+| Search wildcards | `"%" + term.trim() + "%"` as the bound value | `default search(...)` calling `searchLike("%" + ... + "%")` |
+| Generated id | `RETURN_GENERATED_KEYS` + `getGeneratedKeys()` | `@GetGeneratedKeys("book_id")` + `default create(...)` |
+| NULL `Integer` | `ps.setObject(4, v, Types.INTEGER)` | automatic for `Integer` properties |
+| Close resources | try-with-resources | automatic (`onDemand`) |
+| Failure | catch `SQLException`, log, throw `DataAccessException` | `JdbiException` (unchecked), mapped to `error.jsp` in `web.xml` |
+| Files per entity | `XDao` + `XDaoImpl` | `XDao` only |
+
+Services, controllers and JSPs do not change between the styles: the method signatures are the same and neither throws a checked exception.
+
+### [A] Plain JDBC
 
 Pattern: interface + implementation. SQL only. `PreparedStatement` for every query, `?` placeholders, `%` wildcards added to the **bound value**, try-with-resources on `Connection`, `PreparedStatement` and `ResultSet`. Log the `SQLException` and throw `DataAccessException`.
 
@@ -694,6 +800,206 @@ l.setReturnedOn(rs.getObject("returned_on", LocalDate.class));
 
 Never concatenate request values into SQL. `executeQuery` returns rows, `executeUpdate` returns rows changed.
 
+### [B] Jdbi
+
+No `Impl` classes (delete any you have). Each DAO is an interface:
+- `@SqlQuery` / `@SqlUpdate` hold the SQL. `:name` placeholders become prepared-statement parameters.
+- `@Bind("id")` fills `:id`. `@BindBean` fills `:isbn`, `:title`... from the object's getters.
+- `@RegisterBeanMapper(Book.class)` turns each row into a `Book`.
+- A `default` method is ordinary Java inside the interface (wildcards, writing the new id back).
+- If your IDE shows red imports, press Alt+Enter. They live in `org.jdbi.v3.sqlobject.config`, `.customizer` and `.statement`.
+
+**`BookDao`**:
+
+```java
+package your.pkg.dao;
+
+import java.util.List;
+
+import org.jdbi.v3.sqlobject.config.RegisterBeanMapper;
+import org.jdbi.v3.sqlobject.customizer.Bind;
+import org.jdbi.v3.sqlobject.customizer.BindBean;
+import org.jdbi.v3.sqlobject.statement.GetGeneratedKeys;
+import org.jdbi.v3.sqlobject.statement.SqlQuery;
+import org.jdbi.v3.sqlobject.statement.SqlUpdate;
+
+import your.pkg.model.Book;
+
+public interface BookDao {
+
+    // Shared column list. "author AS auther" because the Book property is spelled auther.
+    // "available" is computed from open loans, not stored.
+    String SELECT =
+            "SELECT b.book_id, b.isbn, b.title, b.author AS auther, b.genre, b.synopsis, b.published_year, "
+          + "NOT EXISTS (SELECT 1 FROM loans l WHERE l.book_id = b.book_id AND l.returned_on IS NULL) AS available "
+          + "FROM books b";
+
+    @SqlQuery(SELECT + " ORDER BY b.book_id")
+    @RegisterBeanMapper(Book.class)
+    List<Book> findAll();
+
+    /** null when no row matches. */
+    @SqlQuery(SELECT + " WHERE b.book_id = :id")
+    @RegisterBeanMapper(Book.class)
+    Book findById(@Bind("id") int id);
+
+    /** null when no row matches. Used for the duplicate-ISBN check. */
+    @SqlQuery(SELECT + " WHERE b.isbn = :isbn")
+    @RegisterBeanMapper(Book.class)
+    Book findByIsbn(@Bind("isbn") String isbn);
+
+    @SqlQuery(SELECT + " WHERE b.title LIKE :like OR b.author LIKE :like ORDER BY b.book_id")
+    @RegisterBeanMapper(Book.class)
+    List<Book> searchLike(@Bind("like") String like);
+
+    /** Wildcards are added to the VALUE, never concatenated into the SQL text. */
+    default List<Book> search(String term) {
+        return searchLike("%" + term.trim() + "%");
+    }
+
+    @SqlUpdate("INSERT INTO books (isbn, title, author, genre, synopsis, published_year) "
+             + "VALUES (:isbn, :title, :auther, :genre, :synopsis, :publishedYear)")
+    @GetGeneratedKeys("book_id")
+    int insert(@BindBean Book book);
+
+    /** Inserts and writes the new auto-increment id back into the book. */
+    default void create(Book book) {
+        book.setBookId(insert(book));
+    }
+
+    @SqlUpdate("UPDATE books SET isbn = :isbn, title = :title, author = :auther, genre = :genre, "
+             + "synopsis = :synopsis, published_year = :publishedYear WHERE book_id = :bookId")
+    void update(@BindBean Book book);
+
+    /** Loan rows for this book are removed by ON DELETE CASCADE. */
+    @SqlUpdate("DELETE FROM books WHERE book_id = :id")
+    void delete(@Bind("id") int id);
+}
+```
+
+**`MemberDao`**:
+
+```java
+package your.pkg.dao;
+
+import java.util.List;
+
+import org.jdbi.v3.sqlobject.config.RegisterBeanMapper;
+import org.jdbi.v3.sqlobject.customizer.Bind;
+import org.jdbi.v3.sqlobject.customizer.BindBean;
+import org.jdbi.v3.sqlobject.statement.GetGeneratedKeys;
+import org.jdbi.v3.sqlobject.statement.SqlQuery;
+import org.jdbi.v3.sqlobject.statement.SqlUpdate;
+
+import your.pkg.model.Member;
+
+public interface MemberDao {
+
+    String SELECT =
+            "SELECT member_id, member_number, full_name, email, username, password, role FROM members";
+
+    @SqlQuery(SELECT + " ORDER BY member_id")
+    @RegisterBeanMapper(Member.class)
+    List<Member> findAll();
+
+    @SqlQuery(SELECT + " WHERE member_id = :id")
+    @RegisterBeanMapper(Member.class)
+    Member findById(@Bind("id") int id);
+
+    @SqlQuery(SELECT + " WHERE username = :username")
+    @RegisterBeanMapper(Member.class)
+    Member findByUsername(@Bind("username") String username);
+
+    @SqlQuery(SELECT + " WHERE member_number = :memberNumber")
+    @RegisterBeanMapper(Member.class)
+    Member findByMemberNumber(@Bind("memberNumber") String memberNumber);
+
+    @SqlQuery(SELECT + " WHERE email = :email")
+    @RegisterBeanMapper(Member.class)
+    Member findByEmail(@Bind("email") String email);
+
+    @SqlQuery(SELECT + " WHERE full_name LIKE :like OR member_number LIKE :like ORDER BY member_id")
+    @RegisterBeanMapper(Member.class)
+    List<Member> searchLike(@Bind("like") String like);
+
+    default List<Member> search(String term) {
+        return searchLike("%" + term.trim() + "%");
+    }
+
+    @SqlUpdate("INSERT INTO members (member_number, full_name, email, username, password, role) "
+             + "VALUES (:memberNumber, :fullName, :email, :username, :password, :role)")
+    @GetGeneratedKeys("member_id")
+    int insert(@BindBean Member member);
+
+    default void create(Member member) {
+        member.setMemberId(insert(member));
+    }
+
+    @SqlUpdate("UPDATE members SET member_number = :memberNumber, full_name = :fullName, email = :email, "
+             + "username = :username, password = :password, role = :role WHERE member_id = :memberId")
+    void update(@BindBean Member member);
+
+    /** Their loans are removed by ON DELETE CASCADE. */
+    @SqlUpdate("DELETE FROM members WHERE member_id = :id")
+    void delete(@Bind("id") int id);
+}
+```
+
+**`LoanDao`**:
+
+```java
+package your.pkg.dao;
+
+import java.util.List;
+
+import org.jdbi.v3.sqlobject.config.RegisterBeanMapper;
+import org.jdbi.v3.sqlobject.customizer.Bind;
+import org.jdbi.v3.sqlobject.statement.SqlQuery;
+import org.jdbi.v3.sqlobject.statement.SqlUpdate;
+
+import your.pkg.model.Loan;
+
+public interface LoanDao {
+
+    // "title AS bookTitle" fills Loan.bookTitle for display
+    String SELECT_LOANS =
+            "SELECT l.loan_id, l.member_id, l.book_id, b.title AS bookTitle, l.borrowed_on, l.returned_on "
+          + "FROM loans l JOIN books b ON b.book_id = l.book_id ";
+
+    @SqlUpdate("INSERT INTO loans (member_id, book_id, borrowed_on) VALUES (:memberId, :bookId, CURDATE())")
+    void create(@Bind("memberId") int memberId, @Bind("bookId") int bookId);
+
+    /** Rows changed by the return. Zero means this member had no open loan of that book. */
+    @SqlUpdate("UPDATE loans SET returned_on = CURDATE() "
+             + "WHERE member_id = :memberId AND book_id = :bookId AND returned_on IS NULL")
+    int markReturnedRows(@Bind("memberId") int memberId, @Bind("bookId") int bookId);
+
+    default boolean markReturned(int memberId, int bookId) {
+        return markReturnedRows(memberId, bookId) > 0;
+    }
+
+    @SqlQuery("SELECT COUNT(*) FROM loans WHERE member_id = :memberId AND returned_on IS NULL")
+    int countOpenByMember(@Bind("memberId") int memberId);
+
+    @SqlQuery(SELECT_LOANS + "WHERE l.member_id = :memberId AND l.returned_on IS NULL ORDER BY l.borrowed_on")
+    @RegisterBeanMapper(Loan.class)
+    List<Loan> findOpenByMember(@Bind("memberId") int memberId);
+
+    @SqlQuery(SELECT_LOANS + "WHERE l.member_id = :memberId AND l.returned_on IS NOT NULL ORDER BY l.returned_on DESC")
+    @RegisterBeanMapper(Loan.class)
+    List<Loan> findHistoryByMember(@Bind("memberId") int memberId);
+
+    @SqlQuery("SELECT EXISTS (SELECT 1 FROM loans WHERE book_id = :bookId AND returned_on IS NULL)")
+    boolean hasOpenLoan(@Bind("bookId") int bookId);
+}
+```
+
+Jdbi gotchas:
+- Column and property names must match (`author` vs `auther`): alias in the SQL (`b.author AS auther`) or the field stays `null`.
+- The `:name` in `@BindBean` SQL must match a getter (`:publishedYear` for `getPublishedYear()`), or you get `Missing named parameter`.
+- Dates map to `LocalDate` automatically; `Integer`/`Boolean` wrappers handle NULLs.
+- The interface must be `public`, and Jdbi needs the `SqlObjectPlugin` (installed in `Database`).
+
 ---
 
 ## 10. Services (rules + validation)
@@ -848,6 +1154,46 @@ public class LoanService {
     public int openCount(int memberId)      { return loanDao.countOpenByMember(memberId); }
 }
 ```
+
+### Getting a DAO: services and controllers ([A] vs [B])
+
+The only difference between the styles above the DAO layer is how a DAO object is obtained.
+
+**`BookService` constructor:**
+
+```java
+// [A] plain JDBC
+public BookService() { this(new BookDaoImpl(), new LoanDaoImpl()); }
+
+// [B] Jdbi   (import your.pkg.config.Database;  no *DaoImpl imports)
+public BookService() { this(Database.dao(BookDao.class), Database.dao(LoanDao.class)); }
+```
+
+**`MemberService`:** `new MemberDaoImpl()` becomes `Database.dao(MemberDao.class)`.
+
+**`LoanService` fields:**
+
+```java
+// [A]
+private final BookDao bookDao = new BookDaoImpl();
+private final LoanDao loanDao = new LoanDaoImpl();
+
+// [B]
+private final BookDao bookDao = Database.dao(BookDao.class);
+private final LoanDao loanDao = Database.dao(LoanDao.class);
+```
+
+**Controllers** (anywhere you wrote `new MemberDaoImpl()`):
+
+```java
+// [A]
+private final MemberDao memberDao = new MemberDaoImpl();
+
+// [B]
+private final MemberDao memberDao = Database.dao(MemberDao.class);
+```
+
+Switching styles later: replace every `new XDaoImpl()` with `Database.dao(XDao.class)` (or back), swap `Database.java` and the DAO files, and add/remove the Jdbi dependencies and the `JdbiException` error-page. Nothing else changes.
 
 ---
 
@@ -1270,6 +1616,15 @@ Notes:
 - Constraints are checked before servlet mapping, so a member typing a librarian URL gets **403** even if that page doesn't exist.
 - Roles come from `member_roles` (section 4) through the Realm (section 5).
 
+**[B] Jdbi only: add a second error-page** beside the `DataAccessException` one. Jdbi reports database failures as `JdbiException`; Tomcat still logs the full stack trace server-side and the user sees only `error.jsp`:
+
+```xml
+<error-page>
+    <exception-type>org.jdbi.v3.core.JdbiException</exception-type>
+    <location>/WEB-INF/error.jsp</location>
+</error-page>
+```
+
 **`login.jsp`** (outside WEB-INF) with exactly these field names:
 
 ```jsp
@@ -1495,10 +1850,12 @@ Notes:
 ## 16. Rules checklist + evidence screenshots
 
 **Brief rules (tick before submitting):**
-- [ ] Every query is a `PreparedStatement`; no request value is concatenated into SQL
+- [ ] **[A]** Every query is a `PreparedStatement`; no request value is concatenated into SQL
+- [ ] **[B]** Every query uses named parameters (`:name` via `@Bind`/`@BindBean`); no request value is concatenated into SQL; **lecturer approved Jdbi**
 - [ ] `%` wildcards are added to the bound value
-- [ ] try-with-resources on every Connection, PreparedStatement, ResultSet
-- [ ] No stack trace reaches a page (DAO throws `DataAccessException`, `web.xml` error-page)
+- [ ] **[A]** try-with-resources on every Connection, PreparedStatement, ResultSet
+- [ ] **[B]** DAOs created through `Database.dao(...)` (`onDemand`), no manual connection code anywhere
+- [ ] No stack trace reaches a page (**[A]** DAO throws `DataAccessException`; **[B]** `JdbiException` error-page added; both mapped in `web.xml`)
 - [ ] No scriptlets in any JSP (search for `<%` and only allow `<%@` and `<%--`)
 - [ ] Every user value printed through `<c:out>`
 - [ ] Every JSP except login pages is under `WEB-INF`
@@ -1554,6 +1911,12 @@ Name files `studentnumber_AWD_CA3_2026.zip` and `.pdf` (see the brief), include 
 | Refresh repeats an action | Missing redirect | POST then `sendRedirect` |
 | 404 on a JSP | JSP is under `WEB-INF` (correct) | Reach it via a controller `forward` |
 | Browser Back shows a protected page after logout | Cached | `NoCacheFilter` on protected URLs |
+| **[B]** `NoClassDefFoundError: org/jdbi/...` | Jdbi jars not in the WAR | Both `jdbi3-core` and `jdbi3-sqlobject` in the pom, same version, then `mvn clean package` |
+| **[B]** A field is `null`/blank though the DB has data | Column and property names differ (`author` vs `auther`) | Alias in the SQL: `b.author AS auther` |
+| **[B]** `Missing named parameter 'x'` | `:x` has no matching getter or `@Bind` name | Match the property name exactly (`:publishedYear` for `getPublishedYear()`) |
+| **[B]** `Unable to ... no SqlObject plugin` | Plugin not installed | `jdbi.installPlugin(new SqlObjectPlugin())` in `Database.java` |
+| **[B]** Red annotation imports | Wrong package guessed | Alt+Enter; they are in `org.jdbi.v3.sqlobject.config`, `.customizer`, `.statement` |
+| **[B]** Stack trace on screen for a DB error | No `JdbiException` error-page | Add it to `web.xml` (section 13) |
 
 ---
 
@@ -1562,9 +1925,174 @@ Name files `studentnumber_AWD_CA3_2026.zip` and `.pdf` (see the brief), include 
 1. Check MySQL + Workbench, find the root password; check Tomcat `lib` has the connector jar
 2. Copy this file and the LIBIS project beside the new project
 3. Schema + seed -> run it, `SELECT` to confirm
-4. `pom.xml`, `context.xml`, `Database.java`, `web.xml`; deploy a trivial page to prove Tomcat works
+4. Decide the DAO style (**A** unless Jdbi is allowed), then `pom.xml`, `context.xml`, `Database.java` (A or B version), `web.xml`; deploy a trivial page to prove Tomcat works
 5. Login + roles working **before** features (log in, 403 test)
 6. Model -> DAO -> service -> controller -> JSP for entity 1, test, screenshot
 7. Entity 2, relationship table, business rules
 8. i18n if asked
 9. Check section 16, zip and submit
+
+
+---
+
+## 18. Adapting this to a different project
+
+Think of every app in this stack as three kinds of table:
+
+| Role | LIBIS | Your new project (example) |
+|---|---|---|
+| **Users** (log in, have a role) | `members` | staff, students, patients, customers |
+| **Main entity** (CRUD'd by the admin role) | `books` | medicines, courses, products, rooms |
+| **Link / transaction** (user + entity + dates) | `loans` | appointments, enrolments, orders, bookings |
+
+Everything below is "rename these things" or "rewrite these things". Do it **in this order**, so the project compiles as you go.
+
+### Step 0: copy and rename the project
+
+1. Copy the whole LIBIS folder, then delete `.idea`, `target`, `.git` from the copy and open it.
+2. Package: right-click the root package in IntelliJ -> Refactor -> **Rename** (it fixes all imports). Do this first.
+3. `pom.xml`: `artifactId`, `finalName`, `<name>`.
+4. `deploy.bat`: `set APP=...`. URL becomes `/NEWAPP/...`.
+5. `web.xml`: `<realm-name>`.
+
+### Step 1: what you must NOT need to touch
+
+| File | Why it survives unchanged |
+|---|---|
+| `config/Database.java` | Only the JNDI name string, if you rename it (see below) |
+| `exception/*` | Generic |
+| `filter/NoCacheFilter` | Only its `urlPatterns` list |
+| `LogoutController`, `login.jsp`, `login-error.jsp`, `error.jsp` | Only titles/wording; redirect target if `/catalogue` is renamed |
+| `start-tomcat.bat`, structure of `context.xml`, `web.xml` skeleton | Same structure, different names |
+| DAO pattern (`query`, `map`, `bind`, `fail`), service pattern, controller pattern, JSP patterns | You copy the shape, change the nouns |
+
+### Step 2: database (rewrite)
+
+1. New schema name -> update it in **3 places**: the `.sql` (`CREATE SCHEMA` / `USE`), the `url=` in `context.xml`.
+2. Keep the pattern: PK, `UNIQUE` on natural keys, FKs with `ON DELETE CASCADE`, nullable `returned_on`/end date for "open" rows.
+3. **The users table must keep three things**: a unique username column, a password column, a role column. Names are yours, but they feed the Realm (step 3).
+4. Rebuild the `member_roles` view for your names (username column name must equal the users table's username column):
+```sql
+CREATE VIEW user_roles AS SELECT username, role AS role_name FROM staff;
+```
+
+### Step 3: context.xml (edit values only)
+
+| Attribute | Change to |
+|---|---|
+| `Resource name` | e.g. `jdbc/clinic` (optional rename) |
+| `url` | `.../clinic?...` |
+| `password` | the PC's MySQL password |
+| Realm `dataSourceName` | **same** as `Resource name` |
+| Realm `userTable` | your users table |
+| Realm `userNameCol` | its username column (also used in the roles view) |
+| Realm `userCredCol` | its password column |
+| Realm `userRoleTable` | your roles view/table |
+| Realm `roleNameCol` | its role column (`role_name` in the view) |
+| Valve `landingPage` | your main page URL |
+
+If you rename the JNDI name, change it in **three** places: `Resource name`, Realm `dataSourceName`, and the string in `Database.java` (`env.lookup("jdbc/...")`).
+
+### Step 4: web.xml (edit values only)
+
+1. `<security-role>` entries -> your role names (must match the role column values exactly).
+2. Each `<security-constraint>`: `url-pattern`s -> your URLs, `role-name`s -> your roles.
+3. `<error-page>` exception class -> your renamed package.
+4. Pattern of URLs to keep: one shared page for all signed-in users, user-only actions, `/admin/*` (or `/librarian/*`) for the privileged role.
+5. `NoCacheFilter.urlPatterns` -> the same URL list.
+
+### Step 5: entity by entity (the real work)
+
+For every entity (users, main entity, link), these files change **together**. Example: Book -> Medicine.
+
+| # | File | What to rewrite |
+|---|---|---|
+| 1 | SQL table | columns |
+| 2 | `model/Medicine` | fields + getters/setters (property names = what the JSP uses) |
+| 3 | `dao/MedicineDao` | interface methods (add `findByX` for each UNIQUE column) |
+| 4 | **[A]** `dao/MedicineDaoImpl`, or **[B]** the annotated `MedicineDao` interface | **[A]** `SELECT` constant, `INSERT`/`UPDATE` SQL, `bind()`, `map()`, table name in `DELETE`; **[B]** the SQL strings, `:param` names, `AS` aliases |
+| 5 | `service/MedicineService` | `validate()` rules, `tidy()`, duplicate checks, delete rules |
+| 6 | `controller/Medicine*Controller` | `@WebServlet` URL, parameter names read, attribute names, JSP paths, flash messages |
+| 7 | `WEB-INF/.../medicine-*.jsp` | field names, labels, `${...}` properties, form `action` URLs |
+| 8 | `messages*.properties` | keys and both languages |
+
+**Adding or renaming ONE column touches 6 places.** Miss one and you get a blank value or a SQL error:
+1. the `CREATE TABLE`
+2. the model field + getter/setter
+3. DAO: **[A]** `SELECT`, `INSERT`, `UPDATE`, `bind()` indexes, `map()`; **[B]** the `SELECT`/`INSERT`/`UPDATE` strings, the `:param` names, any `AS` alias
+4. service `validate()`
+5. controller `request.getParameter("...")`
+6. form JSP and list JSP
+
+The most common bug: **[A]** `bind()` parameter numbers no longer matching the `?` order in the SQL (count the `?` marks); **[B]** a `:name` that matches no getter, or a column and property with different names (fix with `AS`).
+
+### Step 6: business rules (rewrite)
+
+`LoanService` is the pattern for your own rule service (`AppointmentService`, `EnrolmentService`...):
+
+```java
+public static final int MAX_X = 3;          // the limit, defined once
+
+public void create(int userId, int entityId) throws RuleException {
+    // 1. does the entity exist?
+    // 2. is it free? (computed with NOT EXISTS, not stored)
+    // 3. is the user under their limit? (COUNT of open rows)
+    // 4. dao.create(...)
+}
+public void finish(int userId, int entityId) throws RuleException {
+    // UPDATE ... SET end_date = CURDATE() WHERE ... AND end_date IS NULL ; if 0 rows -> RuleException
+}
+```
+
+Rename `LoanException` to something meaningful, or keep the class and change only the messages.
+
+Derived status pattern (any "is it free / taken" flag):
+
+```sql
+NOT EXISTS (SELECT 1 FROM link_table l WHERE l.entity_id = e.entity_id AND l.end_date IS NULL) AS available
+```
+
+### Step 7: controllers and "who is the user"
+
+- Identity: `request.getRemoteUser()` -> `findByUsername(...)`. Nothing to change except the DAO name.
+- Role check in a JSP: `request.isUserInRole('yourRole')`.
+- Keep the mapping: GET shows, POST changes then redirects.
+
+### Step 8: i18n
+
+1. Copy the bundles, keep key **naming** (`col.*`, `btn.*`, `nav.*`).
+2. Replace the values; add keys for every new label.
+3. Both files must have the same key set.
+
+### Step 9: clean-up searches
+
+IntelliJ: **Ctrl+Shift+F** (Find in Files). Search these, case-sensitive, and fix leftovers:
+
+```
+libis   Libis   LIBIS
+Book    book    books
+Member  member  members
+Loan    loan    loans
+librarian
+auther
+appdb / jdbc/
+```
+
+Use **Ctrl+Shift+R** (Replace in Files) with "Match case" and "Preview" ticked. Replace plural before singular (`books` -> `medicines` first, then `book` -> `medicine`), otherwise you get `medicines` turning into `medicinees`.
+
+### Rename-vs-rewrite summary
+
+| Rename only | Rewrite |
+|---|---|
+| package, artifact, app name, schema name, JNDI name | table columns, SQL strings, `bind`/`map` |
+| roles, URL patterns, realm column names | validation rules, business rules |
+| JSP labels, bundle values | JSP field layout |
+| titles, flash messages | anything that is domain logic |
+
+### 30-minute adaptation drill (practical day)
+
+1. Copy project, rename package/artifact/APP (5 min)
+2. New schema + seed + roles view, run it (5 min)
+3. Edit `context.xml` values (names, password), `web.xml` roles/URLs (5 min)
+4. Deploy and prove **login works with the seeded users** (5 min)
+5. Entity 1: model, DAO, service, controller, JSPs, screenshot (rest)
